@@ -23,82 +23,88 @@ import java.security.KeyStore;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
-import java.time.Instant;
 
 /**
- * Minimal OpenBao client for the database secrets engine.
+ * Minimal OpenBao client for the database secrets engine, operating <b>strictly on behalf of the
+ * end user</b>.
  *
- * <p>Deliberately dependency-free beyond gson (reexported by {@code org.jkiss.dbeaver.model}) and
- * the JDK's own HTTP client — an auth model sits on the connect path of every session, so its
- * dependency surface is kept as small as the job allows.
+ * <h2>The one design rule</h2>
+ * There is no service-identity path here, deliberately. The user's own OIDC access token is
+ * exchanged at OpenBao's JWT auth method for a <em>user-scoped</em> OpenBao token, and the database
+ * credential is requested with that. OpenBao therefore evaluates its own policies against the
+ * authenticated user's identity and groups — it is structurally incapable of issuing a credential
+ * to someone who is not entitled to it, rather than merely configured not to.
  *
- * <p><b>How it authenticates to OpenBao.</b> Kubernetes auth by default: the pod's ServiceAccount
- * JWT is exchanged for a short-lived OpenBao token. That is the correct shape for an in-cluster
- * workload — no static token is stored anywhere. A token file is supported as a fallback for
- * out-of-cluster development only.
+ * <p>An earlier revision authenticated with the pod's ServiceAccount and passed the principal along
+ * as a header. That made OpenBao issue on the <em>server's</em> authority, reducing the principal to
+ * an audit annotation and leaving eligibility unenforced. A fallback to that mode is not provided,
+ * because a fallback that silently downgrades the security model is worse than an outage.
  *
- * <p><b>What it never does.</b> It never logs, echoes, or persists a credential value. Only the
- * username, the lease id and the principal appear in logs — all non-secret and all needed for
- * audit correlation.
+ * <p>Dependency-free beyond gson (reexported by {@code org.jkiss.dbeaver.model}) and the JDK HTTP
+ * client — this sits on the connect path of every session.
+ *
+ * <p>Nothing secret is ever logged: only usernames, lease ids and principals appear, all of which
+ * are needed for audit correlation and none of which are credentials.
  */
 public class OpenBaoClient {
 
     private static final Log log = Log.getLog(OpenBaoClient.class);
 
-    // Deployment-level configuration. Environment rather than connection config: the endpoint and
-    // the pod's own identity are properties of the deployment, not of any single connection.
     public static final String ENV_ADDR = "LUMNUS_OPENBAO_ADDR";
     public static final String ENV_CACERT = "LUMNUS_OPENBAO_CACERT";
-    public static final String ENV_K8S_ROLE = "LUMNUS_OPENBAO_K8S_ROLE";
-    public static final String ENV_K8S_AUTH_PATH = "LUMNUS_OPENBAO_K8S_AUTH_PATH";
-    public static final String ENV_TOKEN_FILE = "LUMNUS_OPENBAO_TOKEN_FILE";
+    /** OpenBao JWT/OIDC auth mount path (the method configured against Keycloak). */
+    public static final String ENV_JWT_AUTH_PATH = "LUMNUS_OPENBAO_JWT_AUTH_PATH";
+    /** OpenBao JWT auth role that maps Keycloak claims/groups onto OpenBao policies. */
+    public static final String ENV_JWT_ROLE = "LUMNUS_OPENBAO_JWT_ROLE";
 
     private static final String DEFAULT_ADDR = "https://vault.lab.lumnus.net:8200";
-    private static final String DEFAULT_K8S_AUTH_PATH = "kubernetes";
-    private static final String SA_JWT_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+    private static final String DEFAULT_JWT_AUTH_PATH = "jwt";
+    private static final String DEFAULT_JWT_ROLE = "cloudbeaver";
 
     private static final Duration TIMEOUT = Duration.ofSeconds(10);
-    /** Renew a little before actual expiry so a connect never races the token's death. */
-    private static final Duration TOKEN_SKEW = Duration.ofSeconds(30);
 
     private final String address;
+    private final String jwtAuthPath;
+    private final String jwtRole;
     private final HttpClient http;
-
-    private String cachedToken;
-    private Instant cachedTokenExpiry = Instant.EPOCH;
 
     public OpenBaoClient() throws DBException {
         this.address = trimTrailingSlash(envOr(ENV_ADDR, DEFAULT_ADDR));
+        this.jwtAuthPath = envOr(ENV_JWT_AUTH_PATH, DEFAULT_JWT_AUTH_PATH);
+        this.jwtRole = envOr(ENV_JWT_ROLE, DEFAULT_JWT_ROLE);
         this.http = buildHttpClient();
     }
 
     /**
-     * Issue a short-lived database credential.
+     * Issue a short-lived database credential <em>as the user</em>.
      *
-     * @param role      the database role configured on the OpenBao side (e.g. {@code substrate-ro})
-     * @param principal the authenticated principal — sent as a header purely so the OpenBao audit
-     *                  log records <em>who</em> the credential was minted for. It is not a
-     *                  substitute for authorization: see the eligibility note in the README.
+     * @param userAccessToken the authenticated user's OIDC access token (forwarded by the proxy)
+     * @param dbRole          the OpenBao database role, e.g. {@code substrate-ro}
+     * @param principal       the user, for log correlation only — authority comes from the token
      */
-    public DynamicCredential issue(String role, String principal) throws DBException {
-        String token = clientToken();
+    public DynamicCredential issueForUser(String userAccessToken, String dbRole, String principal)
+        throws DBException {
+        // 1. Exchange the user's OIDC token for a user-scoped OpenBao token. Deliberately NOT
+        //    cached across users or sessions — the token IS the identity.
+        String userToken = exchangeUserToken(userAccessToken, principal);
+
+        // 2. Request the credential on that token. If the user's policies do not permit this role,
+        //    OpenBao refuses here — which is the entire point.
         HttpRequest req = HttpRequest.newBuilder()
-            .uri(URI.create(address + "/v1/database/creds/" + role))
+            .uri(URI.create(address + "/v1/database/creds/" + dbRole))
             .timeout(TIMEOUT)
-            .header("X-Vault-Token", token)
-            .header("X-Lumnus-Principal", principal)
+            .header("X-Vault-Token", userToken)
             .GET()
             .build();
 
-        JsonObject body = send(req, "issue credentials for role '" + role + "'");
+        JsonObject body = send(req, "issue credentials for role '" + dbRole + "' as " + principal);
         JsonObject data = body.getAsJsonObject("data");
         if (data == null || !data.has("username") || !data.has("password")) {
-            throw new DBException("OpenBao returned no credential for role '" + role
-                + "'. Check that the role exists and the database connection is configured.");
+            throw new DBException("OpenBao returned no credential for role '" + dbRole + "'.");
         }
         String leaseId = body.has("lease_id") ? body.get("lease_id").getAsString() : null;
-        log.debug("OpenBao issued credential user=" + data.get("username").getAsString()
-            + " role=" + role + " principal=" + principal + " lease=" + leaseId);
+        log.debug("OpenBao issued db credential user=" + data.get("username").getAsString()
+            + " role=" + dbRole + " principal=" + principal + " lease=" + leaseId);
 
         return new DynamicCredential(
             data.get("username").getAsString(),
@@ -106,55 +112,32 @@ public class OpenBaoClient {
             leaseId);
     }
 
-    // ── auth ──────────────────────────────────────────────────────────────────────────────────
-
-    private synchronized String clientToken() throws DBException {
-        if (cachedToken != null && Instant.now().isBefore(cachedTokenExpiry)) {
-            return cachedToken;
-        }
-        String tokenFile = System.getenv(ENV_TOKEN_FILE);
-        if (tokenFile != null && !tokenFile.isBlank()) {
-            // Out-of-cluster development fallback. Not the production path.
-            cachedToken = readFile(tokenFile, "OpenBao token file");
-            cachedTokenExpiry = Instant.now().plus(Duration.ofMinutes(5));
-            return cachedToken;
-        }
-        return loginWithKubernetes();
-    }
-
-    private String loginWithKubernetes() throws DBException {
-        String role = System.getenv(ENV_K8S_ROLE);
-        if (role == null || role.isBlank()) {
-            throw new DBException("OpenBao Kubernetes auth is not configured: set " + ENV_K8S_ROLE
-                + " (or " + ENV_TOKEN_FILE + " for out-of-cluster development).");
-        }
-        String jwt = readFile(SA_JWT_PATH, "Kubernetes ServiceAccount token");
-        String authPath = envOr(ENV_K8S_AUTH_PATH, DEFAULT_K8S_AUTH_PATH);
-
+    /** Exchange the user's OIDC access token for a user-scoped OpenBao token. */
+    private String exchangeUserToken(String userAccessToken, String principal) throws DBException {
         JsonObject payload = new JsonObject();
-        payload.addProperty("role", role);
-        payload.addProperty("jwt", jwt);
+        payload.addProperty("role", jwtRole);
+        payload.addProperty("jwt", userAccessToken);
 
         HttpRequest req = HttpRequest.newBuilder()
-            .uri(URI.create(address + "/v1/auth/" + authPath + "/login"))
+            .uri(URI.create(address + "/v1/auth/" + jwtAuthPath + "/login"))
             .timeout(TIMEOUT)
             .header("Content-Type", "application/json")
             .POST(HttpRequest.BodyPublishers.ofString(payload.toString(), StandardCharsets.UTF_8))
             .build();
 
-        JsonObject body = send(req, "authenticate to OpenBao via Kubernetes auth");
+        JsonObject body = send(req, "exchange the access token of '" + principal + "' at OpenBao");
         JsonObject auth = body.getAsJsonObject("auth");
         if (auth == null || !auth.has("client_token")) {
-            throw new DBException("OpenBao Kubernetes login returned no client_token.");
+            throw new DBException("OpenBao JWT login returned no client_token for " + principal);
         }
-        // NB: token-create/login returns lease_duration under `auth`, NOT `data`. Reading it from
-        // `data` yields a silent false negative — a defect this substrate has already paid for once.
-        long ttl = auth.has("lease_duration") ? auth.get("lease_duration").getAsLong() : 300L;
-
-        cachedToken = auth.get("client_token").getAsString();
-        cachedTokenExpiry = Instant.now().plusSeconds(Math.max(ttl, 1)).minus(TOKEN_SKEW);
-        log.debug("OpenBao Kubernetes login OK, role=" + role + " ttl=" + ttl + "s");
-        return cachedToken;
+        // NB: login returns lease_duration and policies under `auth`, NOT `data` — reading them
+        // from `data` yields a silent false negative. This substrate has paid for that once.
+        if (log.isDebugEnabled()) {
+            log.debug("OpenBao JWT login OK principal=" + principal
+                + " policies=" + auth.get("policies")
+                + " ttl=" + (auth.has("lease_duration") ? auth.get("lease_duration") : "?") + "s");
+        }
+        return auth.get("client_token").getAsString();
     }
 
     // ── plumbing ──────────────────────────────────────────────────────────────────────────────
@@ -167,8 +150,8 @@ public class OpenBaoClient {
             throw new DBException("Could not reach OpenBao at " + address + " to " + what + ".", e);
         }
         if (resp.statusCode() / 100 != 2) {
-            // Deliberately surfaces OpenBao's own error text — it distinguishes "role missing" from
-            // "permission denied" from "engine not mounted", which a generic message would flatten.
+            // Surfaces OpenBao's own error text: it distinguishes "role missing" from "permission
+            // denied" from "token expired", which a generic message would flatten into a guess.
             throw new DBException("OpenBao refused to " + what + " (HTTP " + resp.statusCode()
                 + "): " + resp.body());
         }
@@ -179,7 +162,6 @@ public class OpenBaoClient {
         HttpClient.Builder b = HttpClient.newBuilder()
             .connectTimeout(TIMEOUT)
             .followRedirects(HttpClient.Redirect.NEVER);
-
         String caPath = System.getenv(ENV_CACERT);
         if (caPath != null && !caPath.isBlank()) {
             b.sslContext(trustOnly(caPath));
@@ -187,10 +169,7 @@ public class OpenBaoClient {
         return b.build();
     }
 
-    /**
-     * Build an SSL context trusting only the given CA PEM. The substrate's OpenBao is issued by a
-     * private CA; this avoids requiring a rebuilt JVM truststore in the container image.
-     */
+    /** Trust only the given CA PEM — the substrate's OpenBao uses a private CA. */
     private SSLContext trustOnly(String caPath) throws DBException {
         try (InputStream in = Files.newInputStream(Path.of(caPath))) {
             CertificateFactory cf = CertificateFactory.getInstance("X.509");
@@ -208,14 +187,6 @@ public class OpenBaoClient {
             return ctx;
         } catch (Exception e) {
             throw new DBException("Could not build a trust store from " + ENV_CACERT + "=" + caPath, e);
-        }
-    }
-
-    private static String readFile(String path, String what) throws DBException {
-        try {
-            return Files.readString(Path.of(path)).trim();
-        } catch (Exception e) {
-            throw new DBException("Could not read " + what + " at " + path, e);
         }
     }
 

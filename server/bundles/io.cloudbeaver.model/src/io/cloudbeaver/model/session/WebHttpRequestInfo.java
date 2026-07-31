@@ -24,6 +24,15 @@ import org.jkiss.utils.HttpConstants;
 public class WebHttpRequestInfo {
     public static final String USER_AGENT = HttpConstants.HEADER_USER_AGENT;
 
+    /**
+     * Header carrying the federated (OIDC) access token forwarded by a reverse proxy.
+     * oauth2-proxy emits this with {@code --set-xauthrequest --pass-access-token}.
+     * Overridable for deployments whose proxy uses a different header name.
+     */
+    public static final String FEDERATED_TOKEN_HEADER = System.getProperty(
+        "cloudbeaver.federatedTokenHeader",
+        System.getenv().getOrDefault("CLOUDBEAVER_FEDERATED_TOKEN_HEADER", "X-Auth-Request-Access-Token"));
+
     @Nullable
     private final String id;
     @Nullable
@@ -34,6 +43,13 @@ public class WebHttpRequestInfo {
     private final String lastRemoteUserAgent;
     @NotNull
     private final SessionType sessionType;
+    /**
+     * Read from every request rather than captured once at login: an OIDC access token is
+     * short-lived, so a login-time snapshot goes stale while a browser tab sits idle. The proxy
+     * re-injects a fresh token on each request, so downstream consumers see a live one.
+     */
+    @Nullable
+    private String federatedAccessToken;
 
     public WebHttpRequestInfo(HttpServletRequest request) {
         this(
@@ -42,6 +58,12 @@ public class WebHttpRequestInfo {
             request.getRemoteAddr(),
             request.getHeader(USER_AGENT)
         );
+        this.federatedAccessToken = request.getHeader(FEDERATED_TOKEN_HEADER);
+    }
+
+    @Nullable
+    public String getFederatedAccessToken() {
+        return federatedAccessToken;
     }
 
     public WebHttpRequestInfo(

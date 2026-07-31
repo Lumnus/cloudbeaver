@@ -8,6 +8,7 @@ Bundle-RequiredExecutionEnvironment: JavaSE-21
 Bundle-ActivationPolicy: lazy
 Require-Bundle: org.jkiss.dbeaver.model;visibility:=reexport,
  org.jkiss.dbeaver.model.sm;visibility:=reexport,
- org.jkiss.dbeaver.registry;visibility:=reexport
+ org.jkiss.dbeaver.registry;visibility:=reexport,
+ io.cloudbeaver.model
 Export-Package: io.lumnus.dbeaver.auth.openbao
 Automatic-Module-Name: io.lumnus.dbeaver.auth.openbao

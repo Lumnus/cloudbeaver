@@ -92,6 +92,15 @@ public class WebSession extends BaseWebSession
     private boolean cacheExpired;
     private String clientOrigin;
 
+    /**
+     * Federated (OIDC) access token forwarded by the reverse proxy, refreshed on every request by
+     * {@link #updateSessionParameters}. Held in memory only — never persisted, never serialized to
+     * the client. Consumers that need to act as the authenticated user downstream (for example
+     * exchanging it at a secrets manager for a user-scoped credential) read it from here rather
+     * than acting under the server's own service identity.
+     */
+    private volatile String federatedAccessToken;
+
     protected WebSessionGlobalProjectImpl globalProject;
     private final List<WebServerMessage> sessionMessages = new ArrayList<>();
 
@@ -498,6 +507,22 @@ public class WebSession extends BaseWebSession
     public synchronized void updateSessionParameters(WebHttpRequestInfo requestInfo) {
         this.lastRemoteUserAgent = requestInfo.getLastRemoteUserAgent();
         this.cacheExpired = false;
+        // Refresh rather than overwrite-with-null: not every request path carries the proxy header,
+        // and dropping a still-valid token because one request lacked it would break connects that
+        // the user's live session should be able to make.
+        String token = requestInfo.getFederatedAccessToken();
+        if (token != null && !token.isBlank()) {
+            this.federatedAccessToken = token;
+        }
+    }
+
+    /**
+     * The federated (OIDC) access token of the authenticated user, as last forwarded by the reverse
+     * proxy. {@code null} when the deployment is not behind a token-forwarding proxy.
+     */
+    @Nullable
+    public String getFederatedAccessToken() {
+        return federatedAccessToken;
     }
 
     @Override

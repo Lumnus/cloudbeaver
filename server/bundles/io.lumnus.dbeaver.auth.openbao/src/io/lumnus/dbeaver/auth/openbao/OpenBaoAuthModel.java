@@ -4,6 +4,7 @@
  */
 package io.lumnus.dbeaver.auth.openbao;
 
+import io.cloudbeaver.model.session.WebSession;
 import org.jkiss.code.NotNull;
 import org.jkiss.dbeaver.DBException;
 import org.jkiss.dbeaver.Log;
@@ -11,8 +12,6 @@ import org.jkiss.dbeaver.model.DBPDataSource;
 import org.jkiss.dbeaver.model.DBPDataSourceContainer;
 import org.jkiss.dbeaver.model.access.DBACredentialsProvider;
 import org.jkiss.dbeaver.model.app.DBPDataSourceRegistry;
-import org.jkiss.dbeaver.model.auth.SMCredentials;
-import org.jkiss.dbeaver.model.auth.SMCredentialsProvider;
 import org.jkiss.dbeaver.model.connection.DBPConnectionConfiguration;
 import org.jkiss.dbeaver.model.exec.DBCException;
 import org.jkiss.dbeaver.model.impl.auth.AuthModelDatabaseNative;
@@ -22,29 +21,42 @@ import java.util.Properties;
 
 /**
  * Auth model that issues a <em>fresh, short-lived</em> database credential from OpenBao on every
- * connect, scoped to the authenticated principal.
+ * connect — minted <b>on the authenticated user's own authority</b>, never the server's.
  *
- * <h2>Why this shape</h2>
- * dbeaver-core's auth models are a public extension point
- * ({@code org.jkiss.dbeaver.dataSourceAuth}) and CloudBeaver enumerates them from the core registry
- * at runtime. So this is an <em>additive bundle</em>, not a patch of either project: it survives
- * host version bumps, and it is structurally the same move dbeaver's own {@code AuthModelPgPass}
- * makes — resolve the password from an external source at connect time, rather than from anything
- * stored on the connection.
+ * <h2>Why it is a bundle and not a patch</h2>
+ * {@code org.jkiss.dbeaver.dataSourceAuth} is a public extension point and CloudBeaver enumerates
+ * auth models from the core registry at runtime, so this model is contributed rather than patched
+ * in. It is structurally the same move dbeaver's own {@code AuthModelPgPass} makes: resolve the
+ * password from an external source at connect time instead of from anything stored.
  *
- * <h2>Identity</h2>
- * CloudBeaver binds the authenticated web session into the datasource registry as its credentials
- * provider ({@code dataSourceRegistry.setAuthCredentialsProvider(webSession)}), and
- * {@code WebSession} implements both {@code DBACredentialsProvider} and
- * {@code SMCredentialsProvider}. So the connect path can see <em>who</em> is asking, and this model
- * <b>refuses to mint anything when it cannot</b> — an unattributable credential is worse than a
- * failed connection.
+ * <h2>Whose authority the credential is minted on</h2>
+ * The connect path reaches the authenticated session because CloudBeaver binds it into the
+ * datasource registry as the credentials provider
+ * ({@code dataSourceRegistry.setAuthCredentialsProvider(webSession)}). From the session this model
+ * takes the user's <em>federated OIDC access token</em> and exchanges it at OpenBao's JWT auth
+ * method for a user-scoped OpenBao token. OpenBao then evaluates its own policies against that
+ * user's identity and groups.
  *
- * <h2>What it deliberately does not do</h2>
- * {@link #saveCredentials} is a no-op. The base class writes the resolved username and password back
- * into the connection configuration, which for an ephemeral credential would persist a secret that
- * is dead within the hour and defeat the entire point. Credentials are supplied for the connect and
- * then forgotten.
+ * <p>The consequence worth stating plainly: <b>OpenBao cannot issue a credential the user is not
+ * entitled to</b>, because the request never carries anyone else's authority. Eligibility is not a
+ * check this code performs and could get wrong — it is a property of who signed the request.
+ *
+ * <h2>Two refusals, both deliberate</h2>
+ * <ol>
+ *   <li><b>No identity, no credential.</b> An unattributable credential is worse than a failed
+ *       connection. In a plain DBeaver desktop runtime the provider is not a {@code WebSession},
+ *       so this fails closed by construction rather than by policy.</li>
+ *   <li><b>{@link #saveCredentials} is a no-op.</b> The base class writes the resolved
+ *       username/password back into the stored connection configuration — which for an ephemeral
+ *       credential persists a secret that is dead within the hour and quietly reintroduces exactly
+ *       the stored-password pattern this exists to remove. It would have looked like it worked.</li>
+ * </ol>
+ *
+ * <h2>Idle tabs</h2>
+ * The token is read from the session on every connect, and the session's copy is refreshed on every
+ * HTTP request by the reverse proxy. So a tab left idle for hours still connects, as long as the
+ * user's Keycloak session is alive. When it is not, the proxy bounces them to Keycloak — which is
+ * the correct outcome rather than a silent failure.
  */
 public class OpenBaoAuthModel extends AuthModelDatabaseNative<OpenBaoCredentials> {
 
@@ -52,11 +64,6 @@ public class OpenBaoAuthModel extends AuthModelDatabaseNative<OpenBaoCredentials
 
     /** OpenBao database role to request, e.g. {@code substrate-ro}. Required. */
     public static final String PROP_ROLE = "openbao.role";
-    /**
-     * Optional coarse eligibility gate evaluated inside the server's trust boundary. Real
-     * per-principal eligibility belongs broker-side — see the README.
-     */
-    public static final String PROP_REQUIRED_PERMISSION = "openbao.requiredPermission";
 
     private volatile OpenBaoClient client;
 
@@ -72,25 +79,34 @@ public class OpenBaoAuthModel extends AuthModelDatabaseNative<OpenBaoCredentials
         @NotNull DBPConnectionConfiguration configuration,
         OpenBaoCredentials credentials
     ) {
-        // Deliberately NOT calling super: the whole point is that nothing stored on the connection
-        // is used as a credential. The username and password come from OpenBao or not at all.
+        // Deliberately NOT calling super: nothing stored on the connection is used as a credential.
         try {
             String role = configuration.getAuthProperty(PROP_ROLE);
             if (role == null || role.isBlank()) {
-                throw new DBException("Connection does not declare an OpenBao role. "
-                    + "Set the '" + PROP_ROLE + "' authentication property (e.g. 'substrate-ro').");
+                throw new DBException("Connection does not declare an OpenBao role. Set the '"
+                    + PROP_ROLE + "' authentication property (e.g. 'substrate-ro').");
             }
 
-            String principal = resolvePrincipal(dataSource, configuration);
+            WebSession session = resolveSession(dataSource);
+            String principal = resolvePrincipal(session);
+            String userToken = session.getFederatedAccessToken();
+            if (userToken == null || userToken.isBlank()) {
+                throw new DBException("No federated access token is present for '" + principal
+                    + "'. The credential must be minted on the user's own authority, so this "
+                    + "connection cannot proceed. Check that the reverse proxy forwards the access "
+                    + "token (oauth2-proxy: --set-xauthrequest --pass-access-token).");
+            }
             credentials.setPrincipal(principal);
 
-            OpenBaoClient.DynamicCredential issued = getClient().issue(role, principal);
+            OpenBaoClient.DynamicCredential issued =
+                getClient().issueForUser(userToken, role, principal);
             credentials.setUserName(issued.username());
             credentials.setUserPassword(issued.password());
             credentials.setLeaseId(issued.leaseId());
             credentials.setResolutionError(null);
         } catch (Throwable e) {
-            // Deferred to initAuthentication — loadCredentials is also invoked outside connect.
+            // Deferred to initAuthentication — loadCredentials also runs outside connect, and
+            // throwing here surfaces failures far from the attempt that caused them.
             credentials.setResolutionError(e);
         }
     }
@@ -114,10 +130,7 @@ public class OpenBaoAuthModel extends AuthModelDatabaseNative<OpenBaoCredentials
         return super.initAuthentication(monitor, dataSource, credentials, configuration, connectProps);
     }
 
-    /**
-     * No-op by design — an ephemeral credential must never be written back into the stored
-     * connection configuration. See the class comment.
-     */
+    /** No-op by design — an ephemeral credential must never be persisted. See the class comment. */
     @Override
     public void saveCredentials(
         @NotNull DBPDataSourceContainer dataSource,
@@ -127,10 +140,7 @@ public class OpenBaoAuthModel extends AuthModelDatabaseNative<OpenBaoCredentials
         // intentionally empty
     }
 
-    /**
-     * Supplies the credential for <em>this</em> connect only. Distinct from
-     * {@link #saveCredentials}, whose contract is persistence.
-     */
+    /** Supplies the credential for <em>this</em> connect only; distinct from persistence. */
     @Override
     public void provideCredentials(
         @NotNull DBPDataSourceContainer dataSource,
@@ -143,40 +153,23 @@ public class OpenBaoAuthModel extends AuthModelDatabaseNative<OpenBaoCredentials
 
     // ── identity ──────────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Resolve the authenticated principal, or refuse.
-     *
-     * <p>The cast to {@code SMCredentialsProvider} is what makes this identity-aware, and it holds
-     * because CloudBeaver's {@code WebSession} implements both interfaces. In a plain DBeaver
-     * desktop runtime the provider is something else — in which case there is no authenticated
-     * principal to scope a credential to, and refusing is the correct outcome rather than silently
-     * minting an unattributable one.
-     */
-    private String resolvePrincipal(
-        DBPDataSourceContainer dataSource,
-        DBPConnectionConfiguration configuration
-    ) throws DBException {
+    private WebSession resolveSession(DBPDataSourceContainer dataSource) throws DBException {
         DBPDataSourceRegistry registry = dataSource.getRegistry();
         DBACredentialsProvider provider = registry == null ? null : registry.getAuthCredentialsProvider();
-
-        if (!(provider instanceof SMCredentialsProvider smProvider)) {
-            throw new DBException("No authenticated session is bound to this connection, so a "
-                + "credential cannot be scoped to a principal. This auth model requires a "
-                + "session-authenticated host (CloudBeaver).");
+        if (!(provider instanceof WebSession session)) {
+            throw new DBException("No authenticated web session is bound to this connection, so a "
+                + "credential cannot be minted on a user's authority. This auth model requires a "
+                + "session-authenticated host (CloudBeaver behind an OIDC proxy).");
         }
-        SMCredentials smCredentials = smProvider.getActiveUserCredentials();
-        if (smCredentials == null || smCredentials.getUserId() == null
-            || smCredentials.getUserId().isBlank()) {
+        return session;
+    }
+
+    private String resolvePrincipal(WebSession session) throws DBException {
+        var user = session.getUser();
+        String principal = user == null ? null : user.getUserId();
+        if (principal == null || principal.isBlank()) {
             throw new DBException("The active session carries no user identity. Refusing to issue "
                 + "an unattributable database credential.");
-        }
-        String principal = smCredentials.getUserId();
-
-        String required = configuration.getAuthProperty(PROP_REQUIRED_PERMISSION);
-        if (required != null && !required.isBlank()
-            && !smCredentials.getPermissions().contains(required)) {
-            throw new DBException("Principal '" + principal + "' does not hold the permission '"
-                + required + "' required by this connection.");
         }
         return principal;
     }
