@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?eclipse version="3.2"?>
+
+<plugin>
+
+    <!--
+      Registers a dynamic-credential auth model into dbeaver-core's public auth-model registry.
+
+      This is ADDITIVE: nothing in CloudBeaver or dbeaver-core is patched. CloudBeaver enumerates
+      auth models at runtime via DataSourceProviderRegistry.getApplicableAuthModels(driver), so a
+      model contributed here appears in the connection UI and in data-sources.json without any
+      change to the host application.
+
+      `requiresLocalConfiguration=false` — the credential is resolved from OpenBao at connect time,
+      not from anything stored on the connection.
+    -->
+    <extension point="org.jkiss.dbeaver.dataSourceAuth">
+        <authModel
+            id="lumnus_openbao_dynamic"
+            label="OpenBao Dynamic Credentials"
+            description="Short-lived database credentials issued per connection by OpenBao, scoped to the authenticated principal. Nothing is stored on the connection."
+            class="io.lumnus.dbeaver.auth.openbao.OpenBaoAuthModel"
+            requiresLocalConfiguration="false">
+
+            <!--
+              Datasource PROVIDER ids, not driver ids. MariaDB/Galera is served by the `mysql`
+              provider (mariaDB is a driver within it), so listing `mariaDB` here would be invalid.
+              Verified against dbeaver-core: postgresql / mysql / generic are real provider ids.
+            -->
+            <datasource id="postgresql"/>
+            <datasource id="mysql"/>
+        </authModel>
+    </extension>
+
+</plugin>

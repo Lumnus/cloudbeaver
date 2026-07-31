@@ -1,0 +1,13 @@
+Manifest-Version: 1.0
+Bundle-ManifestVersion: 2
+Bundle-Name: Lumnus OpenBao Dynamic Credentials Auth Model
+Bundle-Vendor: Lumnus
+Bundle-SymbolicName: io.lumnus.dbeaver.auth.openbao;singleton:=true
+Bundle-Version: 1.0.0.qualifier
+Bundle-RequiredExecutionEnvironment: JavaSE-21
+Bundle-ActivationPolicy: lazy
+Require-Bundle: org.jkiss.dbeaver.model;visibility:=reexport,
+ org.jkiss.dbeaver.model.sm;visibility:=reexport,
+ org.jkiss.dbeaver.registry;visibility:=reexport
+Export-Package: io.lumnus.dbeaver.auth.openbao
+Automatic-Module-Name: io.lumnus.dbeaver.auth.openbao

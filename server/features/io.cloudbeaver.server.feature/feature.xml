@@ -44,6 +44,9 @@
     <plugin id="io.cloudbeaver.service.security" version="0.0.0"/>
     <plugin id="io.cloudbeaver.service.ldap.auth" version="0.0.0"/>
 
+    <!-- Lumnus substrate additions (not upstream) -->
+    <plugin id="io.lumnus.dbeaver.auth.openbao" version="0.0.0"/>
+
     <!-- Extra plugins -->
     <plugin id="org.jkiss.dbeaver.data.office" version="0.0.0"/>
     <plugin id="org.jkiss.bundle.apache.poi" version="0.0.0"/>

@@ -31,6 +31,9 @@
         <module>io.cloudbeaver.service.security</module>
         <module>io.cloudbeaver.service.ldap.auth</module>
 
+        <!-- Lumnus substrate additions (not upstream) -->
+        <module>io.lumnus.dbeaver.auth.openbao</module>
+
         <module>io.cloudbeaver.resources.drivers.base</module>
 
         <module>io.cloudbeaver.product.ce</module>
