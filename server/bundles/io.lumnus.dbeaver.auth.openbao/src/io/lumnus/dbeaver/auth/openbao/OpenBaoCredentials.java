@@ -21,6 +21,34 @@ public class OpenBaoCredentials extends AuthModelDatabaseNativeCredentials {
     private String principal;
     private Throwable resolutionError;
 
+    // ── Suppress the inherited username/password FORM FIELDS ──────────────────────────────────
+    // AuthModelDatabaseNativeCredentials annotates getUserName()/getUserPassword() with @Property,
+    // so any subclass inherits them as editable connection properties — and CloudBeaver duly puts
+    // up a credentials dialog before connecting. For this model that dialog is not just noise, it
+    // is a contradiction: the whole point is that the credential is minted from OpenBao against the
+    // authenticated principal at connect time, and nothing is stored on the connection. Asking the
+    // user to type a username and password invites them to supply the very static credential this
+    // replaces.
+    //
+    // Overriding the getters WITHOUT re-declaring @Property removes them from the property set —
+    // the property scanner reads annotations from the most-derived declaration. This is exactly how
+    // CE's own zero-input model does it (OracleAuthOSCredentials, the `oracle_os` "OS
+    // Authentication" model, which reports no properties for the same reason).
+    //
+    // The FIELDS still exist and are still used: initAuthentication() writes the minted username
+    // and password into them via the inherited setters, and the JDBC layer reads them back. Only
+    // their exposure as user-editable properties is withdrawn.
+
+    @Override
+    public String getUserName() {
+        return super.getUserName();
+    }
+
+    @Override
+    public String getUserPassword() {
+        return super.getUserPassword();
+    }
+
     /** OpenBao lease id for the issued credential — carried for audit correlation only. */
     public String getLeaseId() {
         return leaseId;
