@@ -1,0 +1,97 @@
+# CloudBeaver (Lumnus fork) — single-build CI recipe for ci-build / BuildKit. RECONSTRUCTED recipe (2026-11-18, Cell P3).
+#
+# `Dockerfile` in this directory is the runtime half and needs `deploy/cloudbeaver/` pre-assembled by `deploy/assemble.sh`
+# on a workstation (the two-phase-build gap: the maven build needs the `dbeaver` and `dbeaver-common` repos as SIBLINGS
+# of this checkout, which one build context cannot express). This file closes the gap: the siblings are fetched in the
+# builder stage at PINNED commits from the Forgejo copies, then build-backend.sh / build-frontend.sh / assemble.sh are
+# replayed stage by stage. The runtime stage is identical to `Dockerfile`.
+#
+# Reconstruction notes:
+#   - Served coordinate lumnus/cloudbeaver:v26.1.5-lumnus.3 was built on a workstation from this repo at
+#     5b27b89d6a3df386b83201a7e2afc09595f514b1 (branch lumnus/openbao-auth-model; image created 2 minutes after that commit).
+#   - The sibling commits were NOT recorded at the time (assemble.sh cloned `--depth 1` heads, or reused local clones). The
+#     defaults below are the newest commits on devel / the 26.1.5 line at the served build time (2026-08-03T05:12Z); this
+#     is a time-bounded inference, not a record. Equivalence is checked on the product plugin set (artifact 23).
+#   - Build:  ci-build, context `.`, dockerfile_subpath `deploy/docker`, dockerfile_name `Dockerfile.ci`.
+
+ARG DBEAVER_GIT=http://forgejo-http.forgejo.svc.cluster.local:3000/lumnus/dbeaver.git
+ARG DBEAVER_SHA=24d55f0fb248556323531491c0102952bddb4f6a
+ARG DBEAVER_COMMON_GIT=http://forgejo-http.forgejo.svc.cluster.local:3000/lumnus/dbeaver-common.git
+ARG DBEAVER_COMMON_SHA=12d479341a8b9d4488a585e138a54438ff779e6f
+
+# ---- backend: maven/Tycho product + drivers + generated cloudbeaver.conf ----
+FROM maven:3.9-eclipse-temurin-21 AS backend
+ARG DBEAVER_GIT
+ARG DBEAVER_SHA
+ARG DBEAVER_COMMON_GIT
+ARG DBEAVER_COMMON_SHA
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /ws
+RUN set -eux; \
+    for spec in "dbeaver ${DBEAVER_GIT} ${DBEAVER_SHA}" "dbeaver-common ${DBEAVER_COMMON_GIT} ${DBEAVER_COMMON_SHA}"; do \
+      set -- $spec; \
+      git init -q "$1"; \
+      git -C "$1" fetch -q --depth 1 "$2" "$3"; \
+      git -C "$1" checkout -q FETCH_HEAD; \
+      test "$(git -C "$1" rev-parse HEAD)" = "$3"; \
+    done
+COPY . /ws/cloudbeaver
+WORKDIR /ws/cloudbeaver/server/product/aggregate
+RUN mvn -B clean verify -Dheadless-platform
+WORKDIR /ws/cloudbeaver/deploy
+RUN set -eux; \
+    BACKEND_PRODUCT=/ws/cloudbeaver/server/product/web-server/target/products/io.cloudbeaver.product/all/all/all; \
+    ls "$BACKEND_PRODUCT"/plugins/io.lumnus.dbeaver.auth.openbao_*.jar; \
+    mkdir -p /out/server /out/conf /out/workspace /out/web /out/samples; \
+    cp -rp "$BACKEND_PRODUCT"/* /out/server; \
+    cp -rp /ws/cloudbeaver/config/core/* /out/conf; \
+    cp -p /ws/cloudbeaver/config/GlobalConfiguration/.dbeaver/data-sources.json /out/conf/initial-data-sources.conf; \
+    cp -p ./scripts/* /out/; \
+    cp -rp ./drivers /out/drivers; \
+    test "$(find /out/drivers -name '*.jar' | wc -l)" -gt 0; \
+    mvn -B -q -f ../apps/config-generator compile exec:java -Dconfig.output=/out/conf/cloudbeaver.conf; \
+    test -s /out/conf/cloudbeaver.conf
+
+# ---- frontend: yarn 4 (corepack) bundle ----
+FROM node:22-bookworm AS frontend
+COPY webapp /ws/webapp
+WORKDIR /ws/webapp
+RUN corepack enable && yarn install --immutable && yarn clear \
+    && (cd common-react && yarn clear) \
+    && (cd common-typescript && yarn clear) \
+    && (cd packages/product-default && yarn run bundle)
+
+# ---- runtime (identical to deploy/docker/Dockerfile) ----
+FROM eclipse-temurin:21-jre-noble AS runtime
+
+LABEL org.opencontainers.image.title="CloudBeaver (Lumnus)" \
+      org.opencontainers.image.description="CloudBeaver CE with the OpenBao dynamic-credentials auth model" \
+      org.opencontainers.image.source="https://github.com/Lumnus/cloudbeaver" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends curl tini; \
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd -r -g 10001 cloudbeaver; \
+    useradd -r -u 10001 -g cloudbeaver -d /opt/cloudbeaver -s /usr/sbin/nologin cloudbeaver
+
+WORKDIR /opt/cloudbeaver
+
+COPY --from=backend --chown=cloudbeaver:cloudbeaver /out/ /opt/cloudbeaver/
+COPY --from=frontend --chown=cloudbeaver:cloudbeaver /ws/webapp/packages/product-default/lib/ /opt/cloudbeaver/web/
+
+RUN set -eux; \
+    chmod +x /opt/cloudbeaver/*.sh || true; \
+    mkdir -p /opt/cloudbeaver/workspace; \
+    chown -R cloudbeaver:cloudbeaver /opt/cloudbeaver
+
+USER cloudbeaver
+EXPOSE 8978
+VOLUME ["/opt/cloudbeaver/workspace"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8978/status || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["./run-cloudbeaver-server.sh"]
