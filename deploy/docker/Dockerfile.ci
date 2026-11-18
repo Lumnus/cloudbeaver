@@ -3,8 +3,10 @@
 # `Dockerfile` in this directory is the runtime half and needs `deploy/cloudbeaver/` pre-assembled by `deploy/assemble.sh`
 # on a workstation (the two-phase-build gap: the maven build needs the `dbeaver` and `dbeaver-common` repos as SIBLINGS
 # of this checkout, which one build context cannot express). This file closes the gap: the siblings are fetched in the
-# builder stage at PINNED commits from the Forgejo copies, then build-backend.sh / build-frontend.sh / assemble.sh are
-# replayed stage by stage. The runtime stage is identical to `Dockerfile`.
+# builder stage at PINNED commits from upstream GitHub (public, anonymous, sha-verified: the build fails if the fetched
+# commit is not the pinned one), then build-backend.sh / build-frontend.sh / assemble.sh are replayed stage by stage.
+# The runtime stage is identical to `Dockerfile`. Forgejo copies exist (lumnus/dbeaver, lumnus/dbeaver-common, same
+# shas) as the fallback, but the build step has no Forgejo credential, so the default stays on GitHub.
 #
 # Reconstruction notes:
 #   - Served coordinate lumnus/cloudbeaver:v26.1.5-lumnus.3 was built on a workstation from this repo at
@@ -14,9 +16,9 @@
 #     is a time-bounded inference, not a record. Equivalence is checked on the product plugin set (artifact 23).
 #   - Build:  ci-build, context `.`, dockerfile_subpath `deploy/docker`, dockerfile_name `Dockerfile.ci`.
 
-ARG DBEAVER_GIT=http://forgejo-http.forgejo.svc.cluster.local:3000/lumnus/dbeaver.git
+ARG DBEAVER_GIT=https://github.com/dbeaver/dbeaver.git
 ARG DBEAVER_SHA=24d55f0fb248556323531491c0102952bddb4f6a
-ARG DBEAVER_COMMON_GIT=http://forgejo-http.forgejo.svc.cluster.local:3000/lumnus/dbeaver-common.git
+ARG DBEAVER_COMMON_GIT=https://github.com/dbeaver/dbeaver-common.git
 ARG DBEAVER_COMMON_SHA=12d479341a8b9d4488a585e138a54438ff779e6f
 
 # ---- backend: maven/Tycho product + drivers + generated cloudbeaver.conf ----
