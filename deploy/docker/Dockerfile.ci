@@ -11,15 +11,19 @@
 # Reconstruction notes:
 #   - Served coordinate lumnus/cloudbeaver:v26.1.5-lumnus.3 was built on a workstation from this repo at
 #     5b27b89d6a3df386b83201a7e2afc09595f514b1 (branch lumnus/openbao-auth-model; image created 2 minutes after that commit).
-#   - The sibling commits were NOT recorded at the time (assemble.sh cloned `--depth 1` heads, or reused local clones). The
-#     defaults below are the newest commits on devel / the 26.1.5 line at the served build time (2026-08-03T05:12Z); this
-#     is a time-bounded inference, not a record. Equivalence is checked on the product plugin set (artifact 23).
+#   - The sibling commits were NOT recorded at the time (assemble.sh cloned `--depth 1` heads, or reused local clones), and
+#     the build is not replayable at the served time: the Tycho target platform includes the MUTABLE p2 repository
+#     https://repo.dbeaver.net/p2/ce/26.1.5, which DBeaver republished on 2026-08-11T14:41Z (bundle org.apache.commons.jexl
+#     3.1.0 -> org.apache.commons.jexl3 3.7.0). Siblings from before that date (the served build's era) no longer resolve.
+#     The pins below are the first dbeaver commit that matches the republished repository (411c196, 2026-08-11T14:39Z, the
+#     jexl -> jexl3 change) and the newest dbeaver-common commit before it. A forward re-creation, not a bit-for-bit one;
+#     equivalence is checked on the product plugin set and config (artifact 23).
 #   - Build:  ci-build, context `.`, dockerfile_subpath `deploy/docker`, dockerfile_name `Dockerfile.ci`.
 
 ARG DBEAVER_GIT=https://github.com/dbeaver/dbeaver.git
-ARG DBEAVER_SHA=24d55f0fb248556323531491c0102952bddb4f6a
+ARG DBEAVER_SHA=411c196c67f28f19df26a9b00c2c3b57165d483c
 ARG DBEAVER_COMMON_GIT=https://github.com/dbeaver/dbeaver-common.git
-ARG DBEAVER_COMMON_SHA=12d479341a8b9d4488a585e138a54438ff779e6f
+ARG DBEAVER_COMMON_SHA=4ce06517ee00bdbdd8cde4498398f6d9f91ba274
 
 # ---- backend: maven/Tycho product + drivers + generated cloudbeaver.conf ----
 FROM maven:3.9-eclipse-temurin-21 AS backend
@@ -56,8 +60,9 @@ RUN set -eux; \
 
 # ---- frontend: yarn 4 (corepack) bundle ----
 FROM node:22-bookworm AS frontend
-COPY webapp /ws/webapp
-WORKDIR /ws/webapp
+# the GraphQL codegen reads the server schema (server/bundles/...), so the frontend stage needs the whole checkout
+COPY . /ws/cloudbeaver
+WORKDIR /ws/cloudbeaver/webapp
 RUN corepack enable && yarn install --immutable && yarn clear \
     && (cd common-react && yarn clear) \
     && (cd common-typescript && yarn clear) \
@@ -81,7 +86,7 @@ RUN set -eux; \
 WORKDIR /opt/cloudbeaver
 
 COPY --from=backend --chown=cloudbeaver:cloudbeaver /out/ /opt/cloudbeaver/
-COPY --from=frontend --chown=cloudbeaver:cloudbeaver /ws/webapp/packages/product-default/lib/ /opt/cloudbeaver/web/
+COPY --from=frontend --chown=cloudbeaver:cloudbeaver /ws/cloudbeaver/webapp/packages/product-default/lib/ /opt/cloudbeaver/web/
 
 RUN set -eux; \
     chmod +x /opt/cloudbeaver/*.sh || true; \
